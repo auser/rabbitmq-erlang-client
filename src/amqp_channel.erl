@@ -219,7 +219,9 @@ rpc_bottom_half(Reply, State = #c_state{rpc_requests = RequestQueue}) ->
         {empty, _} ->
             exit(empty_rpc_bottom_half);
         {{value, {From, _Method, _Content}}, NewRequestQueue} ->
-            gen_server:reply(From, Reply),
+            case From of none -> ok;
+                         _    -> gen_server:reply(From, Reply)
+            end,
             do_rpc(State#c_state{rpc_requests = NewRequestQueue})
     end.
 
@@ -294,30 +296,39 @@ shutdown_with_reason(Reason, State) ->
 %% Handling of methods from the server
 %%---------------------------------------------------------------------------
 
+%% Close normally
+handle_method(#'channel.close'{reply_code = ReplyCode,
+                               reply_text = ReplyText}, none,
+              #c_state{closing = false} = State) ->
+    do(#'channel.close_ok'{}, none, State),
+    {stop, {server_initiated_close, ReplyCode, ReplyText}, State};
+
+%% We're already closing, so just send back the ok.
+handle_method(#'channel.close'{}, none, State) ->
+    do(#'channel.close_ok'{}, none, State),
+    {noreply, State};
+
+%% Handle 'channel.close_ok': stop channel
+handle_method(CloseOk = #'channel.close_ok'{}, none, State) ->
+    {stop, normal, rpc_bottom_half(CloseOk, State)};
+
+%% Handle all other methods
 handle_method(Method, Content, #c_state{closing = Closing} = State) ->
-    case {Method, Content} of
-        %% Handle 'channel.close': send 'channel.close_ok' and stop channel
-        {#'channel.close'{reply_code = ReplyCode,
-                          reply_text = ReplyText}, none} ->
-            do(#'channel.close_ok'{}, none, State),
-            {stop, {server_initiated_close, ReplyCode, ReplyText}, State};
-        %% Handle 'channel.close_ok': stop channel
-        {CloseOk = #'channel.close_ok'{}, none} ->
-            {stop, normal, rpc_bottom_half(CloseOk, State)};
+    case Closing of
+        %% Drop all incomming traffic if closing
+        just_channel ->
+            ?LOG_INFO("Channel (~p): dropping method ~p from server "
+                      "because channel is closing~n",
+                      [self(), {Method, Content}]),
+            {noreply, State};
+        {connection, Reason} ->
+            ?LOG_INFO("Channel (~p): dropping method ~p from server "
+                      "because connection is closing (~p)~n",
+                      [self(), {Method, Content}, Reason]),
+            {noreply, State};
+        %% Standard handling of incoming method
         _ ->
-            case Closing of
-                %% Drop all incomming traffic except 'channel.close' and
-                %% 'channel.close_ok' when channel is closing (has sent
-                %% 'channel.close')
-                just_channel ->
-                    ?LOG_INFO("Channel (~p): dropping method ~p from server "
-                              "because channel is closing~n",
-                              [self(), {Method, Content}]),
-                    {noreply, State};
-                %% Standard handling of incoming method
-                _ ->
-                    handle_regular_method(Method, amqp_msg(Content), State)
-            end
+            handle_regular_method(Method, amqp_msg(Content), State)
     end.
 
 handle_regular_method(
@@ -404,17 +415,18 @@ init({ParentConnection, ChannelNumber, Driver, StartArgs}) ->
 %% Standard implementation of the call/{2,3} command
 %% @private
 handle_call({call, Method, AmqpMsg}, From, State) ->
-    case check_block(Method, AmqpMsg, State) of
-        ok         -> Content = build_content(AmqpMsg),
-                      case rabbit_framing:is_method_synchronous(Method) of
-                          true ->
-                              {noreply, rpc_top_half(Method, Content, From,
-                                                     State)};
-                          false ->
-                              do(Method, Content, State),
-                              {reply, ok, State}
-                      end;
-        BlockReply -> {reply, BlockReply, State}
+    case {Method, check_block(Method, AmqpMsg, State)} of
+        {#'basic.consume'{}, _} ->
+            {reply, {error, use_subscribe}, State};
+        {_, ok} ->
+            Content = build_content(AmqpMsg),
+            case rabbit_framing:is_method_synchronous(Method) of
+                true  -> {noreply, rpc_top_half(Method, Content, From, State)};
+                false -> do(Method, Content, State),
+                         {reply, ok, State}
+            end;
+        {_, BlockReply} ->
+            {reply, BlockReply, State}
     end;
 
 %% Standard implementation of the subscribe/3 command
@@ -445,12 +457,27 @@ handle_call({subscribe, #'basic.consume'{consumer_tag = Tag} = Method, Consumer}
 %% Standard implementation of the cast/{2,3} command
 %% @private
 handle_cast({cast, Method, AmqpMsg} = Cast, State) ->
-    case check_block(Method, AmqpMsg, State) of
-        ok         -> do(Method, build_content(AmqpMsg), State);
-        BlockReply -> ?LOG_INFO("Channel (~p): discarding method in cast ~p."
-                                "Reason: ~p~n", [self(), Cast, BlockReply])
-    end,
-    {noreply, State};
+    case {Method, check_block(Method, AmqpMsg, State)} of
+        {#'basic.consume'{}, _} ->
+            ?LOG_WARN("Channel (~p): ignoring cast of ~p method. "
+                      "Use subscribe/3 instead!~n", [self(), Method]),
+            {noreply, State};
+        {_, ok} ->
+            Content = build_content(AmqpMsg),
+            case rabbit_framing:is_method_synchronous(Method) of
+                true  -> ?LOG_WARN("Channel (~p): casting synchronous method "
+                                   "~p.~n"
+                                   "The reply will be ignored!~n",
+                                   [self(), Method]),
+                         {noreply, rpc_top_half(Method, Content, none, State)};
+                false -> do(Method, Content, State),
+                         {noreply, State}
+            end;
+        {_, BlockReply} ->
+            ?LOG_WARN("Channel (~p): discarding method in cast ~p.~n"
+                      "Reason: ~p~n", [self(), Cast, BlockReply]),
+            {noreply, State}
+    end;
 
 %% Registers a handler to process return messages
 %% @private
